@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 import tempfile
 import os
-import json
 
 # -----------------------------------------------------------------------------
 # Page Setup
@@ -45,7 +44,7 @@ st.markdown(
 )
 
 # -----------------------------------------------------------------------------
-# Connect to Google Earth Engine
+# Connect to Google Earth Engine (NO JSON PARSING - BULLETPROOF)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Connecting to satellite database...")
 def init_gee():
@@ -57,37 +56,37 @@ def init_gee():
     except Exception:
         pass
 
-    # 2. Streamlit Cloud login using FULL JSON file
+    # 2. Streamlit Cloud login using direct PEM file
     try:
         gee_cfg = st.secrets.get("gee", {})
-        creds_json = gee_cfg.get("credentials_json", "")
-        
-        if not creds_json:
-            st.error("No credentials_json found in Streamlit Secrets.")
+        service_account = gee_cfg.get("service_account", "")
+        private_key = gee_cfg.get("private_key", "")
+        project = gee_cfg.get("project", "my-satellite-app-504119")
+
+        if not service_account or not private_key:
+            st.error("Missing service_account or private_key in Streamlit Secrets.")
             return False
 
-        # Write the full JSON file exactly as Google gave it
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
-            tmp.write(creds_json)
+        # Fix newlines: handles both actual line breaks AND \n escape characters
+        private_key = private_key.replace("\\n", "\n")
+
+        # Write the key to a temporary PEM file exactly as Google expects
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as tmp:
+            tmp.write(private_key)
             key_path = tmp.name
 
-        # Load credentials from the file
+        # Login using the PEM file
         credentials = ee.ServiceAccountCredentials(
-            email=None,  # Google reads it from the JSON file
+            email=service_account,
             key_file=key_path,
         )
         os.unlink(key_path)
 
-        # Extract project ID from the JSON
-        data = json.loads(creds_json)
-        project = data.get("project_id", "my-satellite-app-504119")
-        
         ee.Initialize(credentials, project=project)
         return True
-        
+
     except Exception as exc:
         st.error(f"Cloud login failed: {exc}")
-        st.info("Make sure your service account has Earth Engine API access enabled.")
 
     st.error("Could not connect to satellite database.")
     return False
