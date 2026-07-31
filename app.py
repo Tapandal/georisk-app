@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import tempfile
 import os
+import json
 
 # -----------------------------------------------------------------------------
 # Page Setup
@@ -26,32 +27,14 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Pretty CSS for the cards
+# Pretty CSS
 # -----------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2rem; }
-    .score-value {
-        font-size: 3.5rem;
-        font-weight: 700;
-        line-height: 1.1;
-        margin: 0.5rem 0;
-    }
-    .score-label {
-        font-size: 0.85rem;
-        text-transform: uppercase;
-        letter-spacing: 1.5px;
-        color: #666;
-    }
-    .status-pill {
-        display: inline-block;
-        padding: 6px 16px;
-        border-radius: 20px;
-        font-weight: 600;
-        font-size: 0.95rem;
-        margin-top: 8px;
-    }
+    .score-value { font-size: 3.5rem; font-weight: 700; line-height: 1.1; margin: 0.5rem 0; }
+    .score-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1.5px; color: #666; }
+    .status-pill { display: inline-block; padding: 6px 16px; border-radius: 20px; font-weight: 600; font-size: 0.95rem; margin-top: 8px; }
     .status-normal { background: #d1fae5; color: #065f46; }
     .status-elevated { background: #fef3c7; color: #92400e; }
     .status-high { background: #ffedd5; color: #9a3412; }
@@ -67,27 +50,46 @@ st.markdown(
 @st.cache_resource(show_spinner="Connecting to satellite database...")
 def init_gee():
     """Login to Google Earth Engine."""
+    # 1. Local laptop login
     try:
         ee.Initialize(project='my-satellite-app-504119')
         return True
     except Exception:
         pass
+
+    # 2. Streamlit Cloud login using FULL JSON file
     try:
         gee_cfg = st.secrets.get("gee", {})
-        if gee_cfg and "service_account" in gee_cfg and "private_key" in gee_cfg:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
-                tmp.write(gee_cfg["private_key"])
-                key_path = tmp.name
-            credentials = ee.ServiceAccountCredentials(
-                email=gee_cfg["service_account"], key_file=key_path
-            )
-            os.unlink(key_path)
-            ee.Initialize(credentials)
-            return True
-    except Exception:
-        pass
+        creds_json = gee_cfg.get("credentials_json", "")
+        
+        if not creds_json:
+            st.error("No credentials_json found in Streamlit Secrets.")
+            return False
+
+        # Write the full JSON file exactly as Google gave it
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            tmp.write(creds_json)
+            key_path = tmp.name
+
+        # Load credentials from the file
+        credentials = ee.ServiceAccountCredentials(
+            email=None,  # Google reads it from the JSON file
+            key_file=key_path,
+        )
+        os.unlink(key_path)
+
+        # Extract project ID from the JSON
+        data = json.loads(creds_json)
+        project = data.get("project_id", "my-satellite-app-504119")
+        
+        ee.Initialize(credentials, project=project)
+        return True
+        
+    except Exception as exc:
+        st.error(f"Cloud login failed: {exc}")
+        st.info("Make sure your service account has Earth Engine API access enabled.")
+
     st.error("Could not connect to satellite database.")
-    st.info("If running locally, type: py -c \"import ee; ee.Authenticate()\"")
     return False
 
 
@@ -168,7 +170,6 @@ def main():
     st.title("🛰️ GeoRisk Parametric Monitor")
     st.caption("Live satellite check for insurance triggers. Compares today's plants vs. 5-year history.")
 
-    # --- Sidebar Inputs ---
     with st.sidebar:
         st.header("📍 Location Input")
         input_mode = st.radio("Input Type", ["Lat / Lon", "Pincode"], horizontal=True)
@@ -205,7 +206,6 @@ def main():
         show_ndvi = st.toggle("🌱 Show Plant Health (NDVI)", value=False)
         show_anomaly = st.toggle("⚠️ Show Anomaly Score", value=False)
 
-    # --- Connect to GEE ---
     if not init_gee():
         st.stop()
 
@@ -216,7 +216,6 @@ def main():
     recent_start = today - timedelta(days=lookback_days)
     recent_end = today
 
-    # --- Fetch Data ---
     with st.spinner("Fetching latest satellite photo..."):
         recent_coll = get_recent_collection(aoi, lookback_days)
         recent_count = recent_coll.size().getInfo()
@@ -253,13 +252,11 @@ def main():
     baseline_ndvi = baseline_stats.get("NDVI")
     z_score = anomaly_stats.get("anomaly")
 
-    # --- Build Map ---
     col_map, col_metrics = st.columns([3, 2], gap="large")
 
     with col_map:
         st.subheader("Live Satellite Map")
 
-        # Choose base layer
         if base_map == "Google Satellite (Sharp)":
             m = folium.Map(
                 location=[lat, lon], zoom_start=13,
@@ -269,7 +266,6 @@ def main():
         else:
             m = folium.Map(location=[lat, lon], zoom_start=13, tiles="OpenStreetMap")
 
-        # Add overlays based on toggles
         if show_ndvi:
             ndvi_vis = {
                 "bands": ["NDVI"], "min": -0.2, "max": 0.8,
@@ -292,7 +288,6 @@ def main():
                 attr="Z-Score", name="Anomaly", overlay=True, control=False,
             ).add_to(m)
 
-        # Always add the analysis circle
         folium.Circle(
             location=[lat, lon], radius=buffer_km * 1000,
             color="#1e3a8a", fill=False, weight=2.5,
@@ -300,13 +295,11 @@ def main():
 
         st_folium(m, width=700, height=550, returned_objects=[])
 
-        # Legend
         if show_ndvi:
             st.caption("🟢 Green = Healthy plants | 🔴 Red = Stressed/Dead plants")
         if show_anomaly:
             st.caption("🔵 Blue = Normal | 🔴 Red = Severely abnormal vs. 5-year history")
 
-    # --- Metrics Panel ---
     with col_metrics:
         st.subheader("Insurance Risk Check")
 
